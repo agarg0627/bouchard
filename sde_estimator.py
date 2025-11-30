@@ -8,12 +8,11 @@ Estimate forward SDE parameters from a 1D noisy signal:
 - sigma_jump : jump magnitude std (std of detected jump increments)
 - n_jumps    : number of detected jumps
 
-Hybrid / literature-inspired estimator:
+Literature estimator:
 1. Mancini (2009) optimal threshold jump detection.
 2. Quadratic variation on jump-free increments -> g_add (diffusion D).
 3. Local mean vs variance regression on jump-free windows -> estimate multiplicative variance b,
    then g_mult = sqrt(max(b, 0)).
-4. Robust trimming (remove outlier windows) to stabilize fit.
 """
 
 import numpy as np
@@ -50,7 +49,7 @@ def estimate_sde_parameters(
             "total_time": 0.0,
         }
 
-    # robust initial volatility estimate using MAD (handles jumps better than std)
+    # initial volatility estimate using MAD (handles jumps better than std)
     mad = np.median(np.abs(increments - np.median(increments)))
     sigma_est = max(1e-12, mad / 0.6745)  # scale MAD to std for Gaussian
 
@@ -158,7 +157,7 @@ def estimate_sde_parameters(
         coef, _, _, _ = np.linalg.lstsq(X, seg_vars, rcond=None)
         a_init, b_init = float(coef[0]), float(coef[1])
 
-        # robustify: remove windows with large residuals (trim 10% largest residuals) and refit
+        # remove windows with large residuals and refit
         preds = X @ coef
         residuals = seg_vars - preds
         abs_res = np.abs(residuals)
@@ -175,7 +174,7 @@ def estimate_sde_parameters(
         b_fit = max(b_fit, 0.0)
         g_mult = float(np.sqrt(b_fit))
     else:
-        # not enough windows to regress -> fall back to zero
+        # not enough windows to regress, fall back to zero
         g_mult = 0.0
 
     return {
