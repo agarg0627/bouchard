@@ -2,32 +2,40 @@ from sde_estimator import estimate_sde_parameters
 import numpy as np
 from pathlib import Path
 import matplotlib.pyplot as plt
-import matplotlib.style as style
 
 data_dir = Path("synthetic_mixed_noise")
 files = sorted(data_dir.glob("*.npz"))
 
 mse_g_add, mse_g_mult, mse_lambda, mse_sigma = [], [], [], []
 mse_by_snr = {}
+nmse_by_snr = {}  # NEW: normalized reconstruction error by noise power
+
 rng = np.random.default_rng(42)
 
 for f in files:
     d = np.load(f)
-    y = d["noisy"]
-    clean = d["clean"]
+    y = d["noisy"].astype(np.float64)
+    clean = d["clean"].astype(np.float64)
     snr_db = float(d["snr_total_db"])
-    est = estimate_sde_parameters(y, dt=1.0)
 
-    # ground truth
+    # -------------------------
+    # Compute true quantities
+    # -------------------------
+    clean_power = float(np.mean(clean ** 2))
+    noise_true = y - clean
+    noise_power = float(np.mean(noise_true ** 2)) + 1e-12  # avoid divide-by-zero
+
+    # Ground truth additive
     g_add_true = float(d["noise_power_add"])
-    
-    clean_power = float(np.mean(clean.astype(np.float64) ** 2))
+
+    # Ground truth multiplicative
     if clean_power > 1e-12 and d["noise_power_mult"] > 1e-12:
         g_mult_true = float(np.sqrt(d["noise_power_mult"] / clean_power))
     else:
         g_mult_true = 0.0
 
-    noise_jump = d["noise_jump"]
+    # Ground truth jump stats
+    noise_jump = d["noise_jump"].astype(np.float64)
     n_actual_jumps = np.sum(np.abs(noise_jump) > 1e-10)
     lambda_true = float(n_actual_jumps / len(noise_jump))
 
@@ -36,28 +44,58 @@ for f in files:
     else:
         sigma_jump_true = 0.0
 
+    # -------------------------
+    # Estimate SDE parameters
+    # -------------------------
+    est = estimate_sde_parameters(y, dt=1.0)
+
     mse_g_add.append((est["g_add"] - g_add_true) ** 2)
     mse_g_mult.append((est["g_mult"] - g_mult_true) ** 2)
     mse_lambda.append((est["lambda_jump"] - lambda_true) ** 2)
     mse_sigma.append((est["sigma_jump"] - sigma_jump_true) ** 2)
 
-    # Forward simulation
+    # -------------------------
+    # Forward simulation using estimated params
+    # -------------------------
     n = len(clean)
-    noise_add_sim = rng.normal(0, np.sqrt(max(est["g_add"], 0)), n) if est["g_add"] > 0 else np.zeros(n)
-    noise_mult_sim = clean * rng.normal(0, est["g_mult"], n) if est["g_mult"] > 0 else np.zeros(n)
+
+    # Additive
+    g_add_est = max(float(est["g_add"]), 0.0)
+    noise_add_sim = rng.normal(0, np.sqrt(g_add_est), n)
+
+    # Multiplicative
+    g_mult_est = max(float(est["g_mult"]), 0.0)
+    noise_mult_sim = clean * rng.normal(0, g_mult_est, n)
+
+    # Jump
     noise_jump_sim = np.zeros(n)
-    if est["lambda_jump"] > 0 and est["sigma_jump"] > 0:
-        n_jumps = rng.poisson(est["lambda_jump"] * n)
+    lambda_est = max(float(est["lambda_jump"]), 0.0)
+    sigma_est = max(float(est["sigma_jump"]), 0.0)
+
+    if lambda_est > 0 and sigma_est > 0:
+        n_jumps = rng.poisson(lambda_est * n)
         if n_jumps > 0:
             locs = rng.choice(n, min(n_jumps, n), replace=False)
-            noise_jump_sim[locs] = rng.normal(0, est["sigma_jump"], len(locs))
+            noise_jump_sim[locs] = rng.normal(0, sigma_est, len(locs))
+
     noisy_sim = clean + noise_add_sim + noise_mult_sim + noise_jump_sim
+
+    # -------------------------
+    # Reconstruction error metrics
+    # -------------------------
     recon_mse = np.mean((noisy_sim - y) ** 2)
-    
+    recon_nmse_noise = recon_mse / noise_power  # key metric
+
     if snr_db not in mse_by_snr:
         mse_by_snr[snr_db] = []
-    mse_by_snr[snr_db].append(recon_mse)
+        nmse_by_snr[snr_db] = []
 
+    mse_by_snr[snr_db].append(recon_mse)
+    nmse_by_snr[snr_db].append(recon_nmse_noise)
+
+# -------------------------------------------------------------------
+# Summary printout
+# -------------------------------------------------------------------
 print("Forward SDE parameter estimation summary")
 print("==============================================")
 print(f"g_add      : MSE = {np.mean(mse_g_add):.6f}")
@@ -65,30 +103,32 @@ print(f"g_mult     : MSE = {np.mean(mse_g_mult):.6f}")
 print(f"lambda_jump: MSE = {np.mean(mse_lambda):.6f}")
 print(f"sigma_jump : MSE = {np.mean(mse_sigma):.6f}")
 print("==============================================")
-print("Reconstruction MSE by SNR:")
+
+print("Forward Reconstruction Error (MSE and NMSE_noise):")
 for snr in sorted(mse_by_snr.keys()):
-    print(f"  {snr:+5.1f} dB: {np.mean(mse_by_snr[snr]):.6f}")
-print(f"  Overall:  {np.mean(sum(mse_by_snr.values(), [])):.6f}")
+    avg_mse = np.mean(mse_by_snr[snr])
+    avg_nmse = np.mean(nmse_by_snr[snr])
+    print(f"  {snr:+5.1f} dB:   MSE = {avg_mse:.6f}   NMSE_noise = {avg_nmse:.4f}")
+
+overall_mse = np.mean(sum(mse_by_snr.values(), []))
+overall_nmse = np.mean(sum(nmse_by_snr.values(), []))
+print("==============================================")
+print(f"Overall MSE         : {overall_mse:.6f}")
+print(f"Overall NMSE_noise  : {overall_nmse:.4f}")
 print("==============================================")
 
+# -------------------------------------------------------------------
+# Plot example
+# -------------------------------------------------------------------
+
 def plot_results(ax, title, noisy_x, noisy_sim, color):
-    """Helper function to plot the results on a given axis."""
-    # The noisy signal is a thin gray solid line.
-    ax.plot(noisy_x, color='gray', linestyle='-', linewidth=1.5, label='Noisy Signal', alpha=0.7, zorder=1)
-    # The simulated noisy signal is a thicker, dashed line plotted on top.
-    ax.plot(noisy_sim, color=color, linewidth=3, linestyle='--', label='Simulated Noisy Signal', zorder=3)
-    
+    ax.plot(noisy_x, color='gray', linewidth=1.5, label='Noisy Signal', alpha=0.7)
+    ax.plot(noisy_sim, color=color, linewidth=2.5, linestyle='--', label='Simulated Noisy')
     ax.set_title(title, fontsize=16, fontweight='bold')
-    ax.legend(loc='upper right', fontsize=10)
-    ax.set_xlabel("Signal Dimension")
-    ax.set_ylabel("Amplitude")
-    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+    ax.legend()
+    ax.grid(True)
 
+# Last simulated plot still in `noisy_sim`
 fig, ax = plt.subplots(1, 1, figsize=(24, 7))
-fig.suptitle('SDE Parameter Estimation in Python', fontsize=22, fontweight='bold')
-
-print("Running SDE Parameter Estimation...")
-plot_results(ax, 'Reconstruction of Noisy Signal', y, noisy_sim, 'green')
-
-plt.tight_layout(rect=[0, 0, 1, 0.96])
+plot_results(ax, "Example Forward Reconstruction", y, noisy_sim, 'green')
 plt.show()
