@@ -99,7 +99,8 @@ def estimate_sde_parameters(
     sigma_jump = float(np.std(jump_sizes)) if n_jumps > 1 else 0.0
 
     # ----------------------------
-    # Step 2: g_add via quadratic variation on jump-free increments
+    # Step 2: g_add (raw) via quadratic variation on jump-free increments
+    # Note: This captures total non-jump variance; corrected in Step 4 after g_mult estimation
     # ----------------------------
     non_jump_inc = increments[~jump_mask]
     if non_jump_inc.size > 0:
@@ -112,8 +113,8 @@ def estimate_sde_parameters(
     # ----------------------------
     # Step 3: g_mult via local mean-squared signal vs variance regression (robust)
     # For multiplicative noise n = x * m with m ~ N(0, σ_m),
-    # Var(Δn) ≈ σ_m² * E[x²] in each window
-    # So we regress: seg_var ≈ a + b * seg_mean_sq, where b ≈ σ_m²
+    # Var(Δn) = 2 * σ_m² * E[x²] in each window (factor of 2 from differencing iid noise)
+    # So we regress: seg_var ≈ a + b * seg_mean_sq, where b ≈ 2*σ_m²
     # ----------------------------
     # choose window size for local mean/var if not provided
     if window_size is None:
@@ -170,12 +171,24 @@ def estimate_sde_parameters(
         else:
             a_fit, b_fit = a_init, b_init
 
-        # b_fit corresponds to σ_m² (multiplicative variance); convert to std
+        # b_fit corresponds to 2*σ_m² (factor of 2 from increment variance of iid noise)
+        # Var(Δn) = Var(n[i+1] - n[i]) = 2*Var(n) for iid n
+        # So slope b ≈ 2*σ_mult², hence σ_mult = sqrt(b/2)
         b_fit = max(b_fit, 0.0)
-        g_mult = float(np.sqrt(b_fit))
+        g_mult = float(np.sqrt(b_fit / 2.0))
     else:
         # not enough windows to regress, fall back to zero
         g_mult = 0.0
+
+    # ----------------------------
+    # Step 4: Correct g_add by removing multiplicative noise contribution
+    # The raw quadratic variation estimate includes: σ_add² + σ_mult²·E[y²]
+    # So: g_add_corrected = g_add_raw - g_mult² · E[y²]
+    # ----------------------------
+    if g_mult > 0.0:
+        mean_y_sq = float(np.mean(y ** 2))
+        g_add_corrected = g_add - (g_mult ** 2) * mean_y_sq
+        g_add = max(g_add_corrected, 0.0)  # clamp to non-negative
 
     return {
         "g_add": float(g_add),
