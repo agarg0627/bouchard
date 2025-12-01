@@ -19,7 +19,7 @@ Estimation approach:
 """
 
 import numpy as np
-
+import math
 
 def estimate_sde_parameters(
     y: np.ndarray,
@@ -97,9 +97,42 @@ def estimate_sde_parameters(
     n_jumps = int(jump_indices.size)
     lambda_jump = float(n_jumps / T) if T > 0 else 0.0
     
-    # jump size std: sample std of detected jump increments
-    # Mancini (2009) shows jump size estimation is consistent as dt -> 0
-    sigma_jump = float(np.std(jump_sizes)) if n_jumps > 1 else 0.0
+    # --- Truncation-corrected jump size std (Gaussian truncated MLE) ---
+    # Source: Mancini (2009); Figueroa-López & Mancini (2019)
+    if n_jumps > 1:
+        # use the final threshold used in detection
+        r = float(thresh)
+        z = jump_sizes.astype(float)
+        abs_r = abs(r)
+
+        # Negative log-likelihood for N(0, σ²) truncated to |z| > r
+        def nll(sigma):
+            sigma = float(sigma)
+            if sigma <= 0:
+                return 1e12
+            # truncation probability: P(|J| > r)
+            denom = 1.0 - 2.0 * 0.5 * (1.0 + math.erf(-abs_r / (sigma * np.sqrt(2))))
+            if denom <= 0:
+                return 1e12
+            quad = np.sum(z * z) / (2.0 * sigma * sigma)
+            n = len(z)
+            return n * np.log(sigma) + n * (-np.log(denom)) + quad
+
+        # 1D golden-section search (pure NumPy)
+        sigma0 = np.std(z)
+        a, b = 1e-9, max(5 * sigma0, 1e-6)
+        phi = (1 + np.sqrt(5)) / 2
+        for _ in range(80):
+            c1 = b - (b - a) / phi
+            c2 = a + (b - a) / phi
+            if nll(c1) < nll(c2):
+                b = c2
+            else:
+                a = c1
+
+        sigma_jump = float((a + b) / 2)
+    else:
+        sigma_jump = 0.0
 
     # ----------------------------
     # Step 2: g_add (raw) via quadratic variation on jump-free increments
