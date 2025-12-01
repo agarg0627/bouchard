@@ -97,7 +97,7 @@ def estimate_sde_parameters(
     n_jumps = int(jump_indices.size)
     lambda_jump = float(n_jumps / T) if T > 0 else 0.0
     
-    # --- Truncation-corrected jump size std (Gaussian truncated MLE) ---
+    # Truncation-corrected jump size std (Gaussian truncated MLE) 
     # Source: Mancini (2009); Figueroa-López & Mancini (2019)
     if n_jumps > 1:
         # use the final threshold used in detection
@@ -118,7 +118,7 @@ def estimate_sde_parameters(
             n = len(z)
             return n * np.log(sigma) + n * (-np.log(denom)) + quad
 
-        # 1D golden-section search (pure NumPy)
+        # 1D golden-section search 
         sigma0 = np.std(z)
         a, b = 1e-9, max(5 * sigma0, 1e-6)
         phi = (1 + np.sqrt(5)) / 2
