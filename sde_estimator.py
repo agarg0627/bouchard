@@ -2,17 +2,20 @@
 sde_estimator.py
 
 Estimate forward SDE parameters from a 1D noisy signal:
-- g_add      : additive diffusion coefficient (variance per sample, SDE diffusion D)
-- g_mult     : multiplicative noise std (std of multiplicative factor m_scaled)
+- g_add      : additive noise variance (σ_add²)
+- g_mult     : multiplicative noise std (std of multiplicative factor m, where noise = clean * m)
 - lambda_jump: jump rate (jumps per unit time)
 - sigma_jump : jump magnitude std (std of detected jump increments)
 - n_jumps    : number of detected jumps
 
-Literature estimator:
-1. Mancini (2009) optimal threshold jump detection.
-2. Quadratic variation on jump-free increments -> g_add (diffusion D).
-3. Local mean vs variance regression on jump-free windows -> estimate multiplicative variance b,
-   then g_mult = sqrt(max(b, 0)).
+Estimation approach:
+1. Mancini (2009) / Figueroa-López & Mancini (2019) optimal threshold jump detection.
+2. Quadratic variation on jump-free increments -> raw total variance estimate.
+3. Second-order difference regression with iterative errors-in-variables correction:
+   - Uses Δ²y to reduce signal variation confound (filters linear trends)
+   - Iteratively corrects E[y²] -> E[clean²] to handle EIV bias
+   - Slope of Var(Δ²y) vs E[clean²] gives 6·σ_mult²
+4. Correct g_add by removing multiplicative contribution.
 """
 
 import numpy as np
@@ -112,9 +115,14 @@ def estimate_sde_parameters(
 
     # ----------------------------
     # Step 3: g_mult via local mean-squared signal vs variance regression (robust)
-    # For multiplicative noise n = x * m with m ~ N(0, σ_m),
-    # Var(Δn) = 2 * σ_m² * E[x²] in each window (factor of 2 from differencing iid noise)
-    # So we regress: seg_var ≈ a + b * seg_mean_sq, where b ≈ 2*σ_m²
+    # 
+    # Use SECOND-ORDER differences to reduce signal variation confound:
+    #   Δ²y[i] = y[i+2] - 2*y[i+1] + y[i]
+    # For smooth signals, Δ²clean ≈ clean''·dt² (much smaller than Δclean ≈ clean'·dt)
+    # For iid noise: Var(Δ²n) = 6·σ² (coefficients: 1² + 2² + 1² = 6)
+    #
+    # Model: Var(Δ²y) ≈ 6·σ_add² + 6·σ_mult²·E[x²] + Var(Δ²clean)
+    # Regress: seg_var_2nd ≈ a + b * seg_mean_sq, where b ≈ 6*σ_mult²
     # ----------------------------
     # choose window size for local mean/var if not provided
     if window_size is None:
@@ -123,26 +131,52 @@ def estimate_sde_parameters(
     else:
         window = max(8, int(window_size))
 
-    seg_mean_sqs = []  # E[x²] in each segment
+    seg_mean_sqs = []  # E[y²] in each segment (proxy for E[clean²])
     seg_vars = []
 
-    # we need a jump mask aligned with segments of y: increments have length len(y)-1
-    # for a segment y[i:i+w], increments are length w-1 and correspond to jump_mask[i:i+w-1]
+    # Compute second-order differences: Δ²y[i] = y[i+2] - 2*y[i+1] + y[i]
+    if len(y) >= 3:
+        second_diff = y[2:] - 2.0 * y[1:-1] + y[:-2]
+    else:
+        second_diff = np.array([], dtype=np.float64)
+
+    # Build jump mask for second differences: a second diff is contaminated if
+    # any of its constituent first differences contain a jump
+    # second_diff[i] uses increments[i] and increments[i+1]
+    if len(jump_mask) >= 2:
+        jump_mask_2nd = jump_mask[:-1] | jump_mask[1:]
+    else:
+        jump_mask_2nd = np.array([], dtype=bool)
+
     for i in range(0, len(y), window):
         seg = y[i : i + window]
-        if seg.size < 4:
+        if seg.size < 5:  # need at least 5 points for meaningful second diff stats
             continue
-        seg_inc = np.diff(seg)  # length seg.size-1
-        # slice jump mask to match seg_inc
-        jm_slice = jump_mask[i : i + len(seg_inc)]
-        # ignore windows with too many jumps (they contaminate variance)
-        if jm_slice.sum() > max(0, 0.25 * len(jm_slice)):
+        
+        # second differences for this segment
+        seg_2nd = second_diff[max(0, i) : i + window - 2] if i + window - 2 <= len(second_diff) else np.array([])
+        if seg_2nd.size < 3:
             continue
-        seg_inc_clean = seg_inc[~jm_slice]
-        if seg_inc_clean.size < 2:
+            
+        # corresponding jump mask slice
+        jm_slice_2nd = jump_mask_2nd[max(0, i) : i + len(seg_2nd)] if i + len(seg_2nd) <= len(jump_mask_2nd) else np.array([], dtype=bool)
+        
+        # handle size mismatch
+        min_len = min(len(seg_2nd), len(jm_slice_2nd))
+        if min_len < 3:
             continue
-        seg_mean_sq = float(np.mean(seg ** 2))  # E[x²], not E[x]²
-        seg_var = float(np.var(seg_inc_clean))  # use increment variance in the window
+        seg_2nd = seg_2nd[:min_len]
+        jm_slice_2nd = jm_slice_2nd[:min_len]
+        
+        # ignore windows with too many jumps
+        if jm_slice_2nd.sum() > max(0, 0.25 * len(jm_slice_2nd)):
+            continue
+        seg_2nd_clean = seg_2nd[~jm_slice_2nd]
+        if seg_2nd_clean.size < 3:
+            continue
+            
+        seg_mean_sq = float(np.mean(seg ** 2))  # E[y²] as proxy for E[clean²]
+        seg_var = float(np.var(seg_2nd_clean))  # variance of second differences
         seg_mean_sqs.append(seg_mean_sq)
         seg_vars.append(seg_var)
 
@@ -151,31 +185,60 @@ def estimate_sde_parameters(
 
     g_mult = 0.0
     if seg_mean_sqs.size >= min_windows_for_regression:
-        # Fit the model: seg_var ≈ a + b * seg_mean_sq
+        # ----------------------------
+        # Iterative regression with errors-in-variables correction
+        # Problem: We regress against E[y²], but model uses E[clean²]
+        # E[y²] = E[clean²]·(1 + σ_mult²) + σ_add²
+        # Solution: Iterate to refine E[clean²] estimate
+        # ----------------------------
+        
+        # Initial regression using E[y²] directly
         X = np.vstack([np.ones_like(seg_mean_sqs), seg_mean_sqs]).T
-
-        # initial ordinary least squares
         coef, _, _, _ = np.linalg.lstsq(X, seg_vars, rcond=None)
-        a_init, b_init = float(coef[0]), float(coef[1])
-
-        # remove windows with large residuals and refit
+        a_fit, b_fit = float(coef[0]), float(coef[1])
+        
+        # Robust refit: remove outliers
         preds = X @ coef
         residuals = seg_vars - preds
         abs_res = np.abs(residuals)
-        # compute 90th percentile threshold
         thr = np.percentile(abs_res, 90.0)
         keep_mask = abs_res <= thr
+        
         if keep_mask.sum() >= min_windows_for_regression:
-            coef2, _, _, _ = np.linalg.lstsq(X[keep_mask], seg_vars[keep_mask], rcond=None)
-            a_fit, b_fit = float(coef2[0]), float(coef2[1])
-        else:
-            a_fit, b_fit = a_init, b_init
-
-        # b_fit corresponds to 2*σ_m² (factor of 2 from increment variance of iid noise)
-        # Var(Δn) = Var(n[i+1] - n[i]) = 2*Var(n) for iid n
-        # So slope b ≈ 2*σ_mult², hence σ_mult = sqrt(b/2)
+            coef, _, _, _ = np.linalg.lstsq(X[keep_mask], seg_vars[keep_mask], rcond=None)
+            a_fit, b_fit = float(coef[0]), float(coef[1])
+        
+        # Initial g_mult estimate (slope is 6·σ_mult² for second differences)
         b_fit = max(b_fit, 0.0)
-        g_mult = float(np.sqrt(b_fit / 2.0))
+        g_mult_est = float(np.sqrt(b_fit / 6.0))
+        
+        # Iterative EIV correction (2-3 iterations usually sufficient)
+        g_add_est = max(a_fit / 6.0, 0.0)  # rough g_add from intercept
+        
+        for _ in range(3):
+            # Correct seg_mean_sqs: E[clean²] ≈ (E[y²] - σ_add²) / (1 + σ_mult²)
+            denom = 1.0 + g_mult_est ** 2
+            seg_mean_sqs_corrected = (seg_mean_sqs - g_add_est) / max(denom, 1e-12)
+            seg_mean_sqs_corrected = np.maximum(seg_mean_sqs_corrected, 1e-12)  # keep positive
+            
+            # Re-regress with corrected regressors
+            X_corr = np.vstack([np.ones_like(seg_mean_sqs_corrected), seg_mean_sqs_corrected]).T
+            if keep_mask.sum() >= min_windows_for_regression:
+                coef, _, _, _ = np.linalg.lstsq(X_corr[keep_mask], seg_vars[keep_mask], rcond=None)
+            else:
+                coef, _, _, _ = np.linalg.lstsq(X_corr, seg_vars, rcond=None)
+            a_fit, b_fit = float(coef[0]), float(coef[1])
+            
+            b_fit = max(b_fit, 0.0)
+            g_mult_new = float(np.sqrt(b_fit / 6.0))
+            g_add_est = max(a_fit / 6.0, 0.0)
+            
+            # Check convergence
+            if abs(g_mult_new - g_mult_est) < 1e-9:
+                break
+            g_mult_est = g_mult_new
+        
+        g_mult = g_mult_est
     else:
         # not enough windows to regress, fall back to zero
         g_mult = 0.0
