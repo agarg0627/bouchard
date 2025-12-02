@@ -55,7 +55,7 @@ def estimate_sde_parameters(
             g_add_tsrv = float(-cov_lag1 * dt)
             g_add_tsrv = max(g_add_tsrv, 0.0)
             
-            # Variance-based estimate for blending
+            # Variance-based estimate
             non_jump_inc = increments[~jump_mask]
             if len(non_jump_inc) > 2:
                 T_eff = dt * len(non_jump_inc)
@@ -136,13 +136,9 @@ def estimate_sde_parameters(
     
     if n_jumps >= 2:
         jump_magnitudes = np.abs(jump_sizes.astype(float))
-        sigma_jump_std = np.std(jump_magnitudes, ddof=1)
-        
-        median_mag = np.median(jump_magnitudes)
-        mad = np.median(np.abs(jump_magnitudes - median_mag))
-        sigma_jump_mad = mad / 0.6745
-        
-        sigma_jump = 0.3 * sigma_jump_mad + 0.7 * sigma_jump_std
+        # For |X| where X ~ N(0, σ): std(|X|) = σ * sqrt(1 - 2/π) ≈ 0.6028σ
+        # So: σ = std(|X|) / 0.6028
+        sigma_jump = np.std(jump_magnitudes, ddof=1) / 0.6028
     else:
         sigma_jump = 0.0
 
@@ -247,7 +243,7 @@ def estimate_sde_parameters(
         mean_y_sq = float(np.mean(y ** 2))
         mult_contribution = (g_mult ** 2) * mean_y_sq
         
-        correction_factor = min(mult_contribution / max(g_add, 1e-12), 0.5)
+        correction_factor = min(mult_contribution / max(g_add, 1e-12), 0.3)
         g_add_corrected = g_add * (1 - correction_factor)
         g_add = max(g_add_corrected, 0.0)
 
