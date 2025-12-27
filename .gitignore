@@ -2,3 +2,6 @@ venv/
 __pycache__/
 sythnetic_data/
 synthetic_mixed_noise/
+synthetic_data/ECG_jump/
+synthetic_data/NMR_multiplictative/
+synthetic_data/NMR_additive/
